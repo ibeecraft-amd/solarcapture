@@ -49,7 +49,10 @@ static void sc_ef_vi_burst_cb(struct sc_callback* cb, void* event_info);
 
 static inline int sc_ef_vi_rx_space(struct sc_ef_vi* vi)
 {
-  return vi->rx_ring_max - ef_vi_receive_fill_level(&vi->vi);
+  if (vi->vi.nic_type.arch == EF_VI_ARCH_EFCT)
+    return vi->rx_ring_max - (vi->rx_added & vi->rx_ring_max);
+  else
+    return vi->rx_ring_max - ef_vi_receive_fill_level(&vi->vi);
 }
 
 
@@ -813,7 +816,7 @@ void sc_ef_vi_prep(struct sc_ef_vi* vi)
            (int) sizeof(struct sc_pkt), (int) PKT_DMA_OFF,
            ef_vi_receive_buffer_len(&vi->vi), vi->pkt_pool->pp_buf_size);
   SC_TEST( ef_vi_receive_buffer_len(&vi->vi) <= vi->pkt_pool->pp_buf_size );
-  SC_TEST( ef_vi_receive_fill_level(&vi->vi) == 0 );
+  SC_TEST( ef_vi_receive_fill_level(&vi->vi) == 0 || vi->vi.nic_type.arch == EF_VI_ARCH_EFCT );
 
   while( sc_ef_vi_rx_space(vi) >= vi->rx_refill_batch &&
          vi->pkt_pool->pp_n_bufs >= vi->rx_refill_batch )
@@ -879,9 +882,12 @@ initialise_rx_pkt(struct sc_ef_vi* vi, ef_event event)
 {
   unsigned rx_id = vi->rx_removed & ef_vi_receive_capacity(&vi->vi);
   struct sc_pkt* pkt = vi->rx_pkts[rx_id];
-  TEST(EF_EVENT_RX_RQ_ID(event) == rx_id);
+  //TEST(EF_EVENT_RX_RQ_ID(event) == rx_id);
   ++vi->rx_removed;
-  pkt->sp_usr.iov[0].iov_len = EF_EVENT_RX_BYTES(event) - vi->rx_prefix_len;
+  if (EF_EVENT_TYPE(event) == EF_EVENT_TYPE_RX_REF)
+    pkt->sp_usr.iov[0].iov_len = event.rx_ref.len - vi->rx_prefix_len;
+  else
+    pkt->sp_usr.iov[0].iov_len = EF_EVENT_RX_BYTES(event) - vi->rx_prefix_len;
   pkt->sp_usr.flags = 0;
   return pkt;
 }
@@ -956,6 +962,38 @@ static inline void timestamp_pkt(struct sc_ef_vi* vi, struct sc_pkt* pkt)
     pkt->sp_usr.ts_sec = vi->thread->cur_time.tv_sec;
     pkt->sp_usr.ts_nsec = vi->thread->cur_time.tv_nsec;
   }
+}
+
+static inline void timestamp_efct_pkt(struct sc_ef_vi* vi, struct sc_pkt* pkt,
+    uint32_t pkt_id)
+{
+  if( vi->flags & vif_rx_timestamps ) {
+    const void* dma = efct_vi_rxpkt_get(&vi->vi, pkt_id);
+#ifdef ef_vi_receive_get_precise_timestamp
+    /* Onload 9 new unified mechanism for timestamping - old mechanism is deprecated */
+    ef_precisetime ts;
+    ef_vi_receive_get_precise_timestamp(&vi->vi, dma, &ts);
+#else /* ef_vi_receive_get_precise_timestamp */
+    /* Prior versions of Onload timestamping mechanism */
+    unsigned ts_flags;
+    struct timespec ts;
+    ef_vi_receive_get_timestamp_with_sync_flags(&vi->vi, dma, &ts, &ts_flags);
+#endif /* ef_vi_receive_get_precise_timestamp */
+    /* If the above call fails we get a zero timestamp.  (The only expected
+     * reason for this happening is receiving packets via the loopback
+     * path).
+     *
+     * TODO: Expose the ts_flags info either via sc_packet flags or
+     * metadata.
+     */
+    pkt->sp_usr.ts_sec = ts.tv_sec;
+    pkt->sp_usr.ts_nsec = ts.tv_nsec;
+  }
+  else {
+    pkt->sp_usr.ts_sec = vi->thread->cur_time.tv_sec;
+    pkt->sp_usr.ts_nsec = vi->thread->cur_time.tv_nsec;
+  }
+  efct_vi_rxpkt_release(&vi->vi, pkt_id);
 }
 
 
@@ -1073,13 +1111,40 @@ static void sc_ef_vi_rx_ev(struct sc_ef_vi* vi, struct sc_pkt* pkt,
   assert(pkt->sp_usr.frags_tail == &pkt->sp_usr.frags);
 
   if( EF_EVENT_RX_SOP(event) && ! EF_EVENT_RX_CONT(event) ) {
-    /* Packet fits in a single buffer. */
+    /* Packet fits in a single buffer. EFCT event are single buffer */
     assert(vi->jumbo == NULL);
     pkt->sp_usr.frame_len = pkt->sp_usr.iov[0].iov_len;
     vi->stats->n_rx_bytes += pkt->sp_usr.frame_len;
     vi->stats->n_rx_pkts += 1;
     timestamp_pkt(vi, pkt);
     /* advance_time(vi, pkt->sp_usr.frame_len); */
+    __sc_packet_list_append(&vi->vi_recv_node->ni_pkt_list, &pkt->sp_usr);
+    sc_tracefp(ef_vi_tg(vi), "%s: v%d:%s normal len=%d flags=%x\n", __func__,
+               vi->id, vi->name, (int) pkt->sp_usr.frame_len,
+               (unsigned) pkt->sp_usr.flags);
+    return;
+  }
+
+  if( EF_EVENT_TYPE(event) == EF_EVENT_TYPE_RX_REF ||
+      EF_EVENT_TYPE(event) == EF_EVENT_TYPE_RX_REF_DISCARD ) {
+
+    assert(vi->jumbo == NULL);
+    pkt->sp_usr.frame_len = pkt->sp_usr.iov[0].iov_len;
+    vi->stats->n_rx_bytes += pkt->sp_usr.frame_len;
+    vi->stats->n_rx_pkts += 1;
+
+
+#ifdef ef_vi_receive_get_precise_timestamp
+    /* Onload 9 new unified mechanism for timestamping - old mechanism is deprecated */
+    timestamp_efct_pkt(vi, pkt, event.rx_ref.pkt_id);
+#else /* ef_vi_receive_get_precise_timestamp */
+    /* Prior versions of Onload timestamping mechanism on EFCT */
+    unsigned ts_flags;
+    struct timespec ts;
+    efct_vi_rxpkt_get_timestamp(&vi->vi, event.rx_ref.pkt_id, &ts, &ts_flags);
+    pkt->sp_usr.ts_sec = ts.tv_sec;
+    pkt->sp_usr.ts_nsec = ts.tv_nsec;
+#endif /* ef_vi_receive_get_precise_timestamp */
     __sc_packet_list_append(&vi->vi_recv_node->ni_pkt_list, &pkt->sp_usr);
     sc_tracefp(ef_vi_tg(vi), "%s: v%d:%s normal len=%d flags=%x\n", __func__,
                vi->id, vi->name, (int) pkt->sp_usr.frame_len,
@@ -1354,6 +1419,14 @@ sc_ef_vi_alloc_from_pd(struct sc_ef_vi* vi,
                              NULL, 0, flags);
 }
 
+static void sc_efct_pkt_copy(void* pkt,
+                             struct ef_vi* vi,
+                             ef_event event)
+{
+  const void* efct_pkt = efct_vi_rxpkt_get(vi, event.rx_ref.pkt_id);
+  memcpy(pkt, efct_pkt, event.rx_ref.len);
+  efct_vi_rxpkt_release(vi, event.rx_ref.pkt_id);
+}
 
 void sc_ef_vi_poll(struct sc_ef_vi* vi)
 {
@@ -1378,6 +1451,15 @@ void sc_ef_vi_poll(struct sc_ef_vi* vi)
     case EF_EVENT_TYPE_RX: {
       assert(!vi->packed_stream_mode);
       struct sc_pkt* pkt = initialise_rx_pkt(vi, vi->ef_events[i]);
+      sc_ef_vi_rx_ev(vi, pkt, vi->ef_events[i]);
+      break;
+    }
+
+    case EF_EVENT_TYPE_RX_REF: {
+      struct sc_pkt* pkt = initialise_rx_pkt(vi, vi->ef_events[i]);
+      /* Update length to correct value */
+      pkt->sp_usr.iov[0].iov_len = vi->ef_events[i].rx_ref.len;
+      sc_efct_pkt_copy(pkt->sp_usr.iov[0].iov_base, &vi->vi, vi->ef_events[i]);
       sc_ef_vi_rx_ev(vi, pkt, vi->ef_events[i]);
       break;
     }

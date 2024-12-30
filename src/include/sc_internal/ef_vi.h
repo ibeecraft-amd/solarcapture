@@ -7,6 +7,7 @@
 #define __SC_EF_VI_H__
 
 #include <etherfabric/vi.h>
+#include <etherfabric/efct_vi.h>
 #include <etherfabric/memreg.h>
 #include <etherfabric/pd.h>
 #include <etherfabric/packedstream.h>
